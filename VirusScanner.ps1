@@ -143,7 +143,7 @@ namespace ProtectionScanner {
                     }
                     else resultsTruncated = true;
                 }
-                if (resultIndex >= 0 && CanDeleteDetection(resultMatch.Groups[2].Value)) {
+                if (resultIndex >= 0 && CanQuarantineDetection(resultMatch.Groups[2].Value)) {
                     string filePath = resultMatch.Groups[1].Value;
                     int hashIndex = resultIndex;
                     Task hashTask = Task.Run(async () => {
@@ -184,7 +184,7 @@ namespace ProtectionScanner {
                 Regex.IsMatch(line, @"(?i)\b(error|warning|failed|denied|encrypted|exceeds|limit|can't open)\b");
         }
 
-        private static bool CanDeleteDetection(string resultText) {
+        private static bool CanQuarantineDetection(string resultText) {
             if (!Regex.IsMatch(resultText, @"\bFOUND$", RegexOptions.IgnoreCase)) return false;
             string signature = Regex.Replace(resultText, @"\s+FOUND$", "", RegexOptions.IgnoreCase);
             return !Regex.IsMatch(signature,
@@ -317,7 +317,7 @@ namespace ProtectionScanner {
     internal sealed class DeletionDeadline {
         private const int Waiting = 0;
         private const int Stopped = 1;
-        private const int Deleting = 2;
+        private const int Quarantining = 2;
         private readonly Stopwatch elapsed = Stopwatch.StartNew();
         private readonly object cleanupSync = new object();
         private string temporaryDirectory;
@@ -347,11 +347,11 @@ namespace ProtectionScanner {
             return Interlocked.CompareExchange(ref state, Stopped, Waiting) == Waiting;
         }
 
-        public void BeginDeletion(CancellationToken cancellation) {
+        public void BeginQuarantine(CancellationToken cancellation) {
             cancellation.ThrowIfCancellationRequested();
             if (HasExpired)
                 throw new TimeoutException("Повторная проверка файла превысила 2 минуты.");
-            if (Interlocked.CompareExchange(ref state, Deleting, Waiting) != Waiting)
+            if (Interlocked.CompareExchange(ref state, Quarantining, Waiting) != Waiting)
                 throw new OperationCanceledException();
             cancellation.ThrowIfCancellationRequested();
             if (HasExpired)
@@ -359,20 +359,24 @@ namespace ProtectionScanner {
         }
     }
 
-    public static class SafeFileDeletion {
+    public static class SafeFileQuarantine {
         private const uint GenericRead = 0x80000000;
         private const uint DeleteAccess = 0x00010000;
         private const uint ReadAttributes = 0x00000080;
+        private const uint AddFile = 0x00000002;
         private const uint ShareRead = 0x00000001;
         private const uint ShareWrite = 0x00000002;
         private const uint ShareDelete = 0x00000004;
         private const uint OpenExisting = 3;
         private const uint OpenReparsePoint = 0x00200000;
+        private const uint BackupSemantics = 0x02000000;
         private const uint AttributeDirectory = 0x00000010;
         private const uint AttributeDevice = 0x00000040;
         private const uint AttributeReparsePoint = 0x00000400;
         private const int FileAttributeTagInfo = 9;
-        private const int FileDispositionInfo = 4;
+        private const int FileRenameInfo = 3;
+        private const int ErrorFileExists = 80;
+        private const int ErrorAlreadyExists = 183;
         private const uint FileBegin = 0;
 
         [StructLayout(LayoutKind.Sequential)]
@@ -392,9 +396,6 @@ namespace ProtectionScanner {
             public uint FileIndexHigh;
             public uint FileIndexLow;
         }
-        [StructLayout(LayoutKind.Sequential)]
-        private struct DispositionInfo { [MarshalAs(UnmanagedType.Bool)] public bool DeleteFile; }
-
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern SafeFileHandle CreateFile(string path, uint access, uint share,
             IntPtr security, uint creation, uint flags, IntPtr template);
@@ -415,7 +416,60 @@ namespace ProtectionScanner {
             out long newPosition, uint moveMethod);
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool SetFileInformationByHandle(SafeFileHandle handle, int infoClass,
-            ref DispositionInfo info, uint size);
+            IntPtr info, uint size);
+
+        private static string MoveHandleToQuarantine(SafeFileHandle fileHandle, string sourcePath) {
+            string parentDirectory = Path.GetDirectoryName(Path.GetFullPath(sourcePath));
+            string quarantineDirectory = Path.Combine(parentDirectory, ".ProtectionScannerQuarantine");
+            bool createdDirectory = CreateDirectoryNative(quarantineDirectory, IntPtr.Zero);
+            if (!createdDirectory) {
+                int createError = Marshal.GetLastWin32Error();
+                if (createError != ErrorFileExists && createError != ErrorAlreadyExists)
+                    throw new Win32Exception(createError);
+            }
+            FileAttributes directoryAttributes = File.GetAttributes(quarantineDirectory);
+            if ((directoryAttributes & FileAttributes.Directory) == 0 ||
+                (directoryAttributes & FileAttributes.ReparsePoint) != 0)
+                throw new InvalidOperationException("Папка карантина не является обычной папкой.");
+            if (createdDirectory) {
+                File.SetAttributes(quarantineDirectory, directoryAttributes | FileAttributes.Hidden);
+            }
+            else if ((directoryAttributes & FileAttributes.Hidden) == 0) {
+                throw new InvalidOperationException("Существующая папка карантина не создана этой программой.");
+            }
+            using (SafeFileHandle directoryHandle = CreateFile(quarantineDirectory,
+                AddFile | ReadAttributes, ShareRead | ShareWrite | ShareDelete, IntPtr.Zero,
+                OpenExisting, OpenReparsePoint | BackupSemantics, IntPtr.Zero)) {
+                if (directoryHandle.IsInvalid)
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                AttributeTagInfo attributes;
+                if (!GetFileInformationByHandleEx(directoryHandle, FileAttributeTagInfo, out attributes,
+                    (uint)Marshal.SizeOf(typeof(AttributeTagInfo))))
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                if ((attributes.Attributes & AttributeDirectory) == 0 ||
+                    (attributes.Attributes & AttributeReparsePoint) != 0)
+                    throw new InvalidOperationException("Папка карантина не является обычной папкой.");
+
+                string fileName = Guid.NewGuid().ToString("N") + ".quarantine";
+                byte[] fileNameBytes = Encoding.Unicode.GetBytes(fileName);
+                int rootDirectoryOffset = IntPtr.Size == 8 ? 8 : 4;
+                int fileNameLengthOffset = rootDirectoryOffset + IntPtr.Size;
+                int fileNameOffset = fileNameLengthOffset + sizeof(uint);
+                int bufferLength = fileNameOffset + fileNameBytes.Length;
+                IntPtr renameInfo = Marshal.AllocHGlobal(bufferLength);
+                try {
+                    for (int index = 0; index < bufferLength; index++) Marshal.WriteByte(renameInfo, index, 0);
+                    Marshal.WriteInt32(renameInfo, 0, 0);
+                    Marshal.WriteIntPtr(renameInfo, rootDirectoryOffset, directoryHandle.DangerousGetHandle());
+                    Marshal.WriteInt32(renameInfo, fileNameLengthOffset, fileNameBytes.Length);
+                    Marshal.Copy(fileNameBytes, 0, IntPtr.Add(renameInfo, fileNameOffset), fileNameBytes.Length);
+                    if (!SetFileInformationByHandle(fileHandle, FileRenameInfo, renameInfo, (uint)bufferLength))
+                        throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
+                finally { Marshal.FreeHGlobal(renameInfo); }
+                return Path.Combine(quarantineDirectory, fileName);
+            }
+        }
 
         private static void Rewind(SafeFileHandle handle) {
             long position;
@@ -643,14 +697,14 @@ namespace ProtectionScanner {
 
         private static string VerifyFile(string path, string expectedHash, string expectedSignature,
             string executable, string databasePath, string tempRoot, CancellationToken cancellation,
-            DeletionDeadline deadline, bool deleteAfterVerification) {
+            DeletionDeadline deadline, bool quarantineAfterVerification) {
             cancellation.ThrowIfCancellationRequested();
-            if ((deleteAfterVerification && String.IsNullOrWhiteSpace(expectedHash)) ||
+            if ((quarantineAfterVerification && String.IsNullOrWhiteSpace(expectedHash)) ||
                 (expectedHash != null && !Regex.IsMatch(expectedHash, "^[A-Fa-f0-9]{64}$")))
-                throw new InvalidOperationException("Нет корректного SHA-256 для проверки; удаление отменено.");
+                throw new InvalidOperationException("Нет корректного SHA-256 для проверки; помещение в карантин отменено.");
             if (String.IsNullOrWhiteSpace(expectedSignature))
                 throw new InvalidOperationException("Не указана сигнатура для повторной проверки.");
-            uint access = GenericRead | ReadAttributes | (deleteAfterVerification ? DeleteAccess : 0);
+            uint access = GenericRead | ReadAttributes | (quarantineAfterVerification ? DeleteAccess : 0);
             using (SafeFileHandle handle = CreateFile(path, access,
                 ShareRead, IntPtr.Zero, OpenExisting, OpenReparsePoint, IntPtr.Zero)) {
                 cancellation.ThrowIfCancellationRequested();
@@ -665,19 +719,15 @@ namespace ProtectionScanner {
 
                 string actualHash = HashHandle(handle, cancellation);
                 if (expectedHash != null && !String.Equals(actualHash, expectedHash, StringComparison.OrdinalIgnoreCase))
-                    throw new InvalidOperationException("Файл изменился после проверки; удаление отменено.");
+                    throw new InvalidOperationException("Файл изменился после проверки; помещение в карантин отменено.");
 
                 string actualSignature = ScanOpenHandle(handle, executable, databasePath, tempRoot,
                     cancellation, deadline);
                 if (!String.Equals(actualSignature, expectedSignature, StringComparison.OrdinalIgnoreCase))
                     throw new InvalidOperationException("Повторная проверка не подтвердила ту же вирусную сигнатуру.");
-                if (!deleteAfterVerification) return actualHash;
-                DispositionInfo disposition = new DispositionInfo { DeleteFile = true };
-                deadline.BeginDeletion(cancellation);
-                if (!SetFileInformationByHandle(handle, FileDispositionInfo, ref disposition,
-                    (uint)Marshal.SizeOf(typeof(DispositionInfo))))
-                    throw new Win32Exception(Marshal.GetLastWin32Error());
-                return actualHash;
+                if (!quarantineAfterVerification) return actualHash;
+                deadline.BeginQuarantine(cancellation);
+                return MoveHandleToQuarantine(handle, path);
             }
         }
 
@@ -688,12 +738,11 @@ namespace ProtectionScanner {
                 cancellation, deadline, false);
         }
 
-        internal static bool VerifyAndDelete(string path, string expectedHash, string expectedSignature,
+        internal static string VerifyAndQuarantine(string path, string expectedHash, string expectedSignature,
             string executable, string databasePath, string tempRoot, CancellationToken cancellation,
             DeletionDeadline deadline) {
-            string verifiedHash = VerifyFile(path, expectedHash, expectedSignature, executable,
+            return VerifyFile(path, expectedHash, expectedSignature, executable,
                 databasePath, tempRoot, cancellation, deadline, true);
-            return !String.IsNullOrWhiteSpace(verifiedHash);
         }
     }
 }
@@ -708,19 +757,22 @@ namespace ProtectionScanner {
         }
     }
 
-    public sealed class DeletionResult {
+    public sealed class QuarantineResult {
         public string Path { get; private set; }
-        public bool Deleted { get; private set; }
+        public bool Quarantined { get; private set; }
         public string Message { get; private set; }
         public string VerifiedHash { get; private set; }
-        public DeletionResult(string path, bool deleted, string message, string verifiedHash) {
-            Path = path; Deleted = deleted; Message = message; VerifiedHash = verifiedHash;
+        public string QuarantinePath { get; private set; }
+        public QuarantineResult(string path, bool quarantined, string message, string verifiedHash,
+            string quarantinePath) {
+            Path = path; Quarantined = quarantined; Message = message; VerifiedHash = verifiedHash;
+            QuarantinePath = quarantinePath;
         }
     }
 
-    public sealed class DeletionBatch {
+    public sealed class QuarantineBatch {
         private readonly object sync = new object();
-        private readonly List<DeletionResult> results = new List<DeletionResult>();
+        private readonly List<QuarantineResult> results = new List<QuarantineResult>();
         private readonly DeletionRequest[] requests;
         private readonly string executable;
         private readonly string databasePath;
@@ -734,10 +786,10 @@ namespace ProtectionScanner {
         public bool IsCompleted { get { return worker != null && worker.IsCompleted; } }
         public bool IsCancellationRequested { get { return cancellation.IsCancellationRequested; } }
 
-        public DeletionBatch(DeletionRequest[] requests, string executable, string databasePath, string tempRoot)
+        public QuarantineBatch(DeletionRequest[] requests, string executable, string databasePath, string tempRoot)
             : this(requests, executable, databasePath, tempRoot, false) { }
 
-        public DeletionBatch(DeletionRequest[] requests, string executable, string databasePath, string tempRoot,
+        public QuarantineBatch(DeletionRequest[] requests, string executable, string databasePath, string tempRoot,
             bool verifyOnly) {
             this.requests = requests;
             this.executable = executable;
@@ -749,8 +801,9 @@ namespace ProtectionScanner {
         public void Start() {
             worker = Task.Run(() => {
                 foreach (DeletionRequest request in requests) {
-                    bool deleted = false;
+                    bool quarantined = false;
                     string verifiedHash = null;
+                    string quarantinePath = null;
                     string message;
                     try {
                         cancellation.Token.ThrowIfCancellationRequested();
@@ -759,24 +812,25 @@ namespace ProtectionScanner {
                             message = "Текущий файл повторно проверен.";
                         }
                         else {
-                            deleted = VerifyAndDeleteWithTimeout(request);
-                            message = deleted ? "Удалён пользователем после повторной проверки." : "Удаление не выполнено.";
+                            quarantinePath = VerifyAndQuarantineWithTimeout(request);
+                            quarantined = !String.IsNullOrWhiteSpace(quarantinePath);
+                            message = quarantined ? "Перемещён в карантин после повторной проверки." : "Перемещение в карантин не выполнено.";
                         }
                     }
                     catch (OperationCanceledException) { message = "Операция отменена."; }
                     catch (Exception ex) { message = ex.Message; }
-                    lock (sync) { results.Add(new DeletionResult(request.Path, deleted, message, verifiedHash)); }
+                    lock (sync) { results.Add(new QuarantineResult(request.Path, quarantined, message, verifiedHash, quarantinePath)); }
                     Interlocked.Increment(ref completed);
                     if (cancellation.IsCancellationRequested) break;
                 }
             });
         }
 
-        private bool VerifyAndDeleteWithTimeout(DeletionRequest request) {
+        private string VerifyAndQuarantineWithTimeout(DeletionRequest request) {
             DeletionDeadline deadline = new DeletionDeadline();
             CancellationTokenSource operationCancellation =
                 CancellationTokenSource.CreateLinkedTokenSource(cancellation.Token);
-            Task<bool> verification = Task.Run(() => SafeFileDeletion.VerifyAndDelete(
+            Task<string> verification = Task.Run(() => SafeFileQuarantine.VerifyAndQuarantine(
                 request.Path, request.Sha256, request.Signature, executable, databasePath,
                 tempRoot, operationCancellation.Token, deadline));
             try {
@@ -784,7 +838,7 @@ namespace ProtectionScanner {
                     if (cancellation.IsCancellationRequested || deadline.HasExpired) {
                         if (!deadline.TryStop()) break;
                         operationCancellation.Cancel();
-                        SafeFileDeletion.WaitForTask(verification, 5000);
+                        SafeFileQuarantine.WaitForTask(verification, 5000);
                         if (verification.IsCompleted) return verification.GetAwaiter().GetResult();
                         string cleanupWarning = deadline.GetCleanupWarning();
                         if (cancellation.IsCancellationRequested)
@@ -812,7 +866,7 @@ namespace ProtectionScanner {
             DeletionDeadline deadline = new DeletionDeadline();
             CancellationTokenSource operationCancellation =
                 CancellationTokenSource.CreateLinkedTokenSource(cancellation.Token);
-            Task<string> verification = Task.Run(() => SafeFileDeletion.VerifyForConfirmation(
+            Task<string> verification = Task.Run(() => SafeFileQuarantine.VerifyForConfirmation(
                 request.Path, request.Signature, executable, databasePath,
                 tempRoot, operationCancellation.Token, deadline));
             try {
@@ -820,7 +874,7 @@ namespace ProtectionScanner {
                     if (cancellation.IsCancellationRequested || deadline.HasExpired) {
                         if (!deadline.TryStop()) break;
                         operationCancellation.Cancel();
-                        SafeFileDeletion.WaitForTask(verification, 5000);
+                        SafeFileQuarantine.WaitForTask(verification, 5000);
                         if (verification.IsCompleted) return verification.GetAwaiter().GetResult();
                         string cleanupWarning = deadline.GetCleanupWarning();
                         if (cancellation.IsCancellationRequested)
@@ -845,7 +899,7 @@ namespace ProtectionScanner {
             }
         }
 
-        public DeletionResult[] GetResults() {
+        public QuarantineResult[] GetResults() {
             lock (sync) { return results.ToArray(); }
         }
         public void Cancel() { cancellation.Cancel(); }
@@ -919,21 +973,20 @@ function Get-DatabaseReadiness {
             LastWriteTime = $null
         }
     }
-    $latest = $files | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    $age = (Get-Date) - $latest.LastWriteTime
-    if ($age.TotalDays -gt 7) {
+    $dailyDatabase = @($files | Where-Object { $_.Name -match '^daily\.(cvd|cld)$' })
+    if ($dailyDatabase.Count -eq 0) {
         return [pscustomobject]@{
             Ready = $false
-            StatusText = ('Базы устарели: последняя дата {0:dd.MM.yyyy HH:mm}. Обновите их перед сканированием.' -f $latest.LastWriteTime)
-            Reason = 'Stale'
-            LastWriteTime = $latest.LastWriteTime
+            StatusText = 'Не найдена daily-база ClamAV. Нажмите «Обновить базы» перед проверкой.'
+            Reason = 'MissingDaily'
+            LastWriteTime = $null
         }
     }
     return [pscustomobject]@{
         Ready = $true
-        StatusText = ('Базы готовы. Последнее изменение: {0:dd.MM.yyyy HH:mm}.' -f $latest.LastWriteTime)
-        Reason = 'Ready'
-        LastWriteTime = $latest.LastWriteTime
+        StatusText = 'Файлы баз найдены. Актуальность и целостность проверит ClamAV при запуске сканирования.'
+        Reason = 'Found'
+        LastWriteTime = $null
     }
 }
 
@@ -971,7 +1024,7 @@ function Update-DeleteButtonState {
     if (-not $script:deleteSelectedButton -or -not $script:resultsView) { return }
     $hasDetection = $false
     foreach ($row in $script:resultsView.SelectedItems) {
-        if ($row.Tag -and $row.Tag.CanDelete -and $row.Tag.Signature) {
+        if ($row.Tag -and $row.Tag.CanQuarantine -and $row.Tag.Signature) {
             $hasDetection = $true
             break
         }
@@ -1101,7 +1154,7 @@ function Start-ClamScan {
     if (-not $script:enginePath) { return }
     $databaseReadiness = Get-DatabaseReadiness
     if (-not $databaseReadiness.Ready) {
-        $caption = if ($databaseReadiness.Reason -eq 'Missing') { 'Нет баз' } else { 'База устарела' }
+        $caption = if ($databaseReadiness.Reason -in @('Missing', 'MissingDaily')) { 'Нет баз' } else { 'База недоступна' }
         [System.Windows.Forms.MessageBox]::Show($databaseReadiness.StatusText, $caption) | Out-Null
         return
     }
@@ -1275,24 +1328,24 @@ function Add-ReportMatchesToList {
         [void]$row.SubItems.Add($filePath)
         [void]$row.SubItems.Add('Результат сохранён в памяти')
 
-        if (Test-CanDeleteDetection -ResultText $resultText) {
+        if (Test-CanQuarantineDetection -ResultText $resultText) {
             try {
                 $hash = if ($index -lt $script:scanResultHashes.Count) { $script:scanResultHashes[$index] } else { $null }
                 if (-not $hash) { throw 'Не удалось сохранить хэш файла во время проверки.' }
                 $signature = $resultText -replace '\s+FOUND$', ''
-                $row.Tag = [pscustomobject]@{ Path = $filePath; Sha256 = $hash; Signature = $signature; CanDelete = $true }
-                $row.SubItems[2].Text = 'Перед согласием и удалением содержимое будет перепроверено'
+                $row.Tag = [pscustomobject]@{ Path = $filePath; Sha256 = $hash; Signature = $signature; CanQuarantine = $true }
+                $row.SubItems[2].Text = 'Перед согласием содержимое будет перепроверено и перемещено в карантин'
             }
             catch {
                 $signature = $resultText -replace '\s+FOUND$', ''
-                $row.Tag = [pscustomobject]@{ Path = $filePath; Sha256 = $null; Signature = $signature; CanDelete = $false }
-                $row.SubItems[2].Text = 'Не удалось зафиксировать хэш; удаление отключено'
+                $row.Tag = [pscustomobject]@{ Path = $filePath; Sha256 = $null; Signature = $signature; CanQuarantine = $false }
+                $row.SubItems[2].Text = 'Не удалось зафиксировать хэш; карантин отключён'
             }
         }
         else {
             $signature = $resultText -replace '\s+FOUND$', ''
-            $row.Tag = [pscustomobject]@{ Path = $filePath; Sha256 = $null; Signature = $signature; CanDelete = $false }
-            if ($resultText -match '\bFOUND$') { $row.SubItems[2].Text = 'Предупреждение или нежелательная программа; удаление отключено' }
+            $row.Tag = [pscustomobject]@{ Path = $filePath; Sha256 = $null; Signature = $signature; CanQuarantine = $false }
+            if ($resultText -match '\bFOUND$') { $row.SubItems[2].Text = 'Предупреждение или нежелательная программа; карантин отключён' }
         }
         [void]$script:resultsView.Items.Add($row)
     }
@@ -1305,25 +1358,25 @@ function Add-ReportMatchesToList {
     Update-DeleteButtonState
 }
 
-function Test-CanDeleteDetection {
+function Test-CanQuarantineDetection {
     param([string]$ResultText)
     if ($ResultText -notmatch '\bFOUND$') { return $false }
     $signature = $ResultText -replace '\s+FOUND$', ''
     return $signature -notmatch '(?i)(^|\.)(Heuristics|PUA|Phishing|Broken|Encrypted|Limit|Limits|Exceeded)(\.|$)'
 }
 
-function Confirm-DeleteSelection {
+function Confirm-QuarantineSelection {
     param([System.Windows.Forms.ListViewItem[]]$Rows)
 
     $dialog = New-Object System.Windows.Forms.Form
-    $dialog.Text = 'Подтверждение удаления'
+    $dialog.Text = 'Подтверждение помещения в карантин'
     $dialog.StartPosition = 'CenterParent'
     $dialog.Size = New-Object System.Drawing.Size(780, 560)
     $dialog.MinimumSize = New-Object System.Drawing.Size(640, 420)
     $dialog.Font = $form.Font
 
     $warning = New-Object System.Windows.Forms.Label
-    $warning.Text = 'Будут удалены целые файлы. Срабатывание ClamAV может быть ложным. Каждый файл уже перепроверен перед этим подтверждением; перед удалением хэш и сигнатура будут сверены ещё раз.'
+    $warning.Text = 'Файлы будут перемещены в скрытую папку .ProtectionScannerQuarantine рядом с исходными. Срабатывание ClamAV может быть ложным. Перед перемещением хэш и сигнатура сверяются повторно. При сомнении файл можно вернуть вручную из указанного в списке пути.'
     $warning.Location = New-Object System.Drawing.Point(14, 14)
     $warning.Size = New-Object System.Drawing.Size(735, 42)
     $warning.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
@@ -1346,7 +1399,7 @@ function Confirm-DeleteSelection {
     $dialog.Controls.Add($list)
 
     $deleteButton = New-Object System.Windows.Forms.Button
-    $deleteButton.Text = 'Удалить файлы'
+    $deleteButton.Text = 'В карантин'
     $deleteButton.Location = New-Object System.Drawing.Point(488, 482)
     $deleteButton.Size = New-Object System.Drawing.Size(125, 32)
     $deleteButton.DialogResult = [System.Windows.Forms.DialogResult]::Yes
@@ -1389,7 +1442,7 @@ function Apply-DeletionResults {
             foreach ($row in $signatureRows) {
                 if ($script:verifiedDeletionByPath.ContainsKey($path)) {
                     $row.Tag.Sha256 = $verifiedHash
-                    $row.Tag.CanDelete = $true
+                    $row.Tag.CanQuarantine = $true
                     $row.SubItems[0].Text = 'FOUND — перепроверен'
                     $row.SubItems[2].Text = 'Хэш и та же вирусная сигнатура подтверждены перед согласием'
                 }
@@ -1400,16 +1453,16 @@ function Apply-DeletionResults {
                 else {
                     $row.SubItems[0].Text = 'FOUND — не подтверждён'
                     $row.SubItems[2].Text = [string]$result.Message
-                    $row.Tag.CanDelete = $false
+                    $row.Tag.CanQuarantine = $false
                 }
             }
         }
         else {
-            if ($result.Deleted) {
+            if ($result.Quarantined) {
                 foreach ($row in $matchingRows) {
-                    $row.SubItems[0].Text = 'FOUND — удалён'
-                    $row.SubItems[2].Text = 'Удалён пользователем после повторной проверки'
-                    $row.Tag.CanDelete = $false
+                    $row.SubItems[0].Text = 'FOUND — в карантине'
+                    $row.SubItems[2].Text = [string]$result.QuarantinePath
+                    $row.Tag.CanQuarantine = $false
                 }
             }
             else {
@@ -1418,13 +1471,13 @@ function Apply-DeletionResults {
                 })
                 foreach ($row in $signatureRows) {
                     if ($result.Message -eq 'Операция отменена.') {
-                        $row.SubItems[0].Text = 'FOUND — не удалён'
+                        $row.SubItems[0].Text = 'FOUND — не перемещён'
                         $row.SubItems[2].Text = 'Повторная проверка остановлена пользователем'
                     }
                     else {
-                        $row.SubItems[0].Text = 'FOUND — удаление отменено'
+                        $row.SubItems[0].Text = 'FOUND — карантин отменён'
                         $row.SubItems[2].Text = [string]$result.Message
-                        $row.Tag.CanDelete = $false
+                        $row.Tag.CanQuarantine = $false
                     }
                 }
             }
@@ -1453,7 +1506,7 @@ function Update-DeletionBatch {
             $script:statusLabel.Text = ('Проверяю перед подтверждением: {0} из {1} файлов.' -f $completed, $total)
         }
         else {
-            $script:statusLabel.Text = ('Повторная проверка и удаление: {0} из {1} файлов.' -f $completed, $total)
+            $script:statusLabel.Text = ('Повторная проверка и помещение в карантин: {0} из {1} файлов.' -f $completed, $total)
         }
     }
     if (-not $batch.IsCompleted) { return }
@@ -1472,7 +1525,7 @@ function Update-DeletionBatch {
             if ($script:deletionProcessedPaths.ContainsKey([string]$path)) { continue }
             $expectedSignature = [string]$script:deletionSignatureByPath[$path]
             $signatureRows = @($script:deletionRowsByPath[$path] | Where-Object {
-                $_.Tag -and $_.Tag.CanDelete -and [string]$_.Tag.Signature -ieq $expectedSignature
+                $_.Tag -and $_.Tag.CanQuarantine -and [string]$_.Tag.Signature -ieq $expectedSignature
             })
             foreach ($row in $signatureRows) {
                 $row.SubItems[0].Text = 'FOUND — не проверен'
@@ -1494,10 +1547,10 @@ function Update-DeletionBatch {
                 $script:statusLabel.Text = 'Не удалось подтвердить очистку временных данных повторной проверки.'
             }
             elseif ($cancelled) {
-                $script:statusLabel.Text = 'Проверка перед подтверждением остановлена. Удаление не запускалось.'
+                $script:statusLabel.Text = 'Проверка перед подтверждением остановлена. Перемещение не запускалось.'
             }
             else {
-                $script:statusLabel.Text = 'Не все файлы прошли повторную проверку. Удаление не запускалось.'
+                $script:statusLabel.Text = 'Не все файлы прошли повторную проверку. Перемещение не запускалось.'
             }
             if ($script:closeAfterDeletion) {
                 $script:closeAfterDeletion = $false
@@ -1508,8 +1561,8 @@ function Update-DeletionBatch {
                 }
             }
             [System.Windows.Forms.MessageBox]::Show(
-                "Проверено перед подтверждением: $verifiedCount`r`nНе подтверждено: $failedCount`r`nНе обработано: $unprocessedCount`r`nУдаление не запускалось.",
-                'Удаление не запущено',
+                "Проверено перед подтверждением: $verifiedCount`r`nНе подтверждено: $failedCount`r`nНе обработано: $unprocessedCount`r`nПеремещение в карантин не запускалось.",
+                'Карантин не запущен',
                 [System.Windows.Forms.MessageBoxButtons]::OK,
                 [System.Windows.Forms.MessageBoxIcon]::Warning
             ) | Out-Null
@@ -1520,12 +1573,12 @@ function Update-DeletionBatch {
         foreach ($path in @($script:deletionRowsByPath.Keys)) {
             $verifiedFile = $script:verifiedDeletionByPath[[string]$path]
             foreach ($row in @($script:deletionRowsByPath[$path] | Where-Object {
-                $_.Tag -and $_.Tag.CanDelete -and [string]$_.Tag.Signature -ieq [string]$verifiedFile.Signature
+                $_.Tag -and $_.Tag.CanQuarantine -and [string]$_.Tag.Signature -ieq [string]$verifiedFile.Signature
             })) { $rowsToConfirm.Add($row) }
         }
         $confirmed = $false
         if (-not $script:closeAfterDeletion) {
-            $confirmed = Confirm-DeleteSelection -Rows $rowsToConfirm.ToArray()
+            $confirmed = Confirm-QuarantineSelection -Rows $rowsToConfirm.ToArray()
         }
         if (-not $confirmed -or $script:closeAfterDeletion) {
             $script:deletionBatch = $null
@@ -1543,7 +1596,7 @@ function Update-DeletionBatch {
                 $form.Close()
                 return
             }
-            $script:statusLabel.Text = 'Удаление отменено пользователем после повторной проверки.'
+            $script:statusLabel.Text = 'Перемещение в карантин отменено пользователем после повторной проверки.'
             return
         }
 
@@ -1559,18 +1612,18 @@ function Update-DeletionBatch {
                 ))
             }
             if ($requests.Count -ne $total -or $script:verifiedDeletionByPath.Count -ne $total) {
-                throw 'Состав подтверждённых файлов изменился; удаление не запущено.'
+                throw 'Состав подтверждённых файлов изменился; перемещение не запущено.'
             }
             $script:deletionAppliedCount = 0
             $script:deletionProcessedPaths = New-ExactPathMap
-            $script:deletionMode = 'Delete'
-            $script:deletionBatch = [ProtectionScanner.DeletionBatch]::new(
+            $script:deletionMode = 'Quarantine'
+            $script:deletionBatch = [ProtectionScanner.QuarantineBatch]::new(
                 $requests.ToArray(), [string]$script:enginePath, [string]$script:databaseDirectory,
                 [string](Join-Path $script:dataRoot 'verification-temp'), $false
             )
             $script:deletionBatch.Start()
             $script:progressBar.Value = 0
-            $script:statusLabel.Text = ('Повторно сверяю и удаляю {0} файлов по вашему согласию…' -f $requests.Count)
+            $script:statusLabel.Text = ('Повторно проверяю и перемещаю в карантин {0} файлов по вашему согласию…' -f $requests.Count)
             Set-ScanControls -Busy $true
             $script:timer.Start()
         }
@@ -1584,10 +1637,10 @@ function Update-DeletionBatch {
             $script:deletionMode = $null
             Set-ScanControls -Busy $false
             Update-StatusDisplay
-            $script:statusLabel.Text = 'Не удалось начать удаление; файлы не удалены.'
+            $script:statusLabel.Text = 'Не удалось начать помещение в карантин; исходные файлы сохранены.'
             [System.Windows.Forms.MessageBox]::Show(
-                ('Не удалось начать удаление: ' + $_.Exception.Message),
-                'Ошибка удаления',
+                ('Не удалось поместить файлы в карантин: ' + $_.Exception.Message),
+                'Ошибка карантина',
                 [System.Windows.Forms.MessageBoxButtons]::OK,
                 [System.Windows.Forms.MessageBoxIcon]::Error
             ) | Out-Null
@@ -1596,8 +1649,8 @@ function Update-DeletionBatch {
     }
 
     $cancelled = [bool]$batch.IsCancellationRequested
-    $deletedCount = @($results | Where-Object { $_.Deleted }).Count
-    $failedCount = $results.Count - $deletedCount
+    $quarantinedCount = @($results | Where-Object { $_.Quarantined }).Count
+    $failedCount = $results.Count - $quarantinedCount
     $unprocessedCount = [Math]::Max(0, $total - $results.Count)
     $cleanupIncomplete = @($results | Where-Object { $_.Message -match '(?i)временн(ые|ых) данн' }).Count -gt 0
     foreach ($path in @($script:deletionRowsByPath.Keys)) {
@@ -1632,15 +1685,15 @@ function Update-DeletionBatch {
         $script:statusLabel.Text = 'Не удалось подтвердить очистку временных файлов. Проверьте строки ошибок перед закрытием.'
     }
     elseif ($cancelled) {
-        $script:statusLabel.Text = 'Удаление остановлено. Уже удалённые файлы показаны в списке.'
+        $script:statusLabel.Text = 'Операция остановлена. Уже перемещённые файлы показаны в списке.'
     }
     else {
         $script:progressBar.Value = 100
-        $script:statusLabel.Text = 'Удаление с повторной проверкой завершено.'
+        $script:statusLabel.Text = 'Повторная проверка и помещение в карантин завершены.'
     }
     [System.Windows.Forms.MessageBox]::Show(
-        "Удалено файлов: $deletedCount`r`nНе удалено: $failedCount`r`nНе обработано: $unprocessedCount",
-        'Результат удаления',
+        "В карантине: $quarantinedCount`r`nНе перемещено: $failedCount`r`nНе обработано: $unprocessedCount",
+        'Результат карантина',
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Information
     ) | Out-Null
@@ -1728,7 +1781,7 @@ $script:saveReportButton.Enabled = $false
 $form.Controls.Add($script:saveReportButton)
 
 $script:deleteSelectedButton = New-Object System.Windows.Forms.Button
-$script:deleteSelectedButton.Text = 'Удалить выбранные…'
+$script:deleteSelectedButton.Text = 'В карантин…'
 $script:deleteSelectedButton.Location = New-Object System.Drawing.Point(622, 176)
 $script:deleteSelectedButton.Size = New-Object System.Drawing.Size(150, 36)
 $script:deleteSelectedButton.Enabled = $false
@@ -1768,7 +1821,7 @@ $script:resultsView.Add_SelectedIndexChanged({ Update-DeleteButtonState })
 $form.Controls.Add($script:resultsView)
 
 $footer = New-Object System.Windows.Forms.Label
-$footer.Text = 'Проверка только по запросу; ClamAV для Windows не обеспечивает постоянную защиту. Удаление обнаруженных файлов выполняется вручную после подтверждения.'
+$footer.Text = 'Проверка только по запросу; ClamAV для Windows не обеспечивает постоянную защиту. Перемещение обнаруженных файлов в карантин выполняется после подтверждения.'
 $footer.Location = New-Object System.Drawing.Point(24, 578)
 $footer.Size = New-Object System.Drawing.Size(860, 28)
 $footer.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left
@@ -1937,7 +1990,7 @@ $script:locateButton.Add_Click({
 $script:downloadButton.Add_Click({ Start-Process 'https://www.clamav.net/downloads' })
 $script:cancelButton.Add_Click({
     if ($script:deletionBatch) {
-        $script:statusLabel.Text = 'Останавливаю повторную проверку и удаление…'
+        $script:statusLabel.Text = 'Останавливаю повторную проверку и помещение в карантин…'
         try { $script:deletionBatch.Cancel() } catch { }
     }
     elseif ($script:countJob) {
@@ -1979,13 +2032,13 @@ $script:saveReportButton.Add_Click({
     $dialog.Dispose()
 })
 $script:deleteSelectedButton.Add_Click({
-    $selectedRows = @($script:resultsView.SelectedItems | Where-Object { $_.Tag -and $_.Tag.CanDelete -and $_.Tag.Signature })
+    $selectedRows = @($script:resultsView.SelectedItems | Where-Object { $_.Tag -and $_.Tag.CanQuarantine -and $_.Tag.Signature })
     $selectedByIdentity = New-ExactPathMap
     $identityByPath = New-ExactPathMap
     foreach ($row in $selectedRows) {
         $path = [string]$row.Tag.Path
         $fileIdentity = $null
-        try { $fileIdentity = [ProtectionScanner.SafeFileDeletion]::GetFileIdentity($path) }
+        try { $fileIdentity = [ProtectionScanner.SafeFileQuarantine]::GetFileIdentity($path) }
         catch {
             $hasCaseVariant = $false
             foreach ($candidateRow in $script:resultsView.Items) {
@@ -1999,7 +2052,7 @@ $script:deleteSelectedButton.Add_Click({
             }
             if ($hasCaseVariant) {
                 [System.Windows.Forms.MessageBox]::Show(
-                    'Не удалось определить, какие записи с разным регистром относятся к тому же файлу. Удаление не запущено.',
+                    'Не удалось определить, какие записи с разным регистром относятся к тому же файлу. Перемещение не запущено.',
                     'Не удалось проверить файл',
                     [System.Windows.Forms.MessageBoxButtons]::OK,
                     [System.Windows.Forms.MessageBoxIcon]::Warning
@@ -2041,7 +2094,7 @@ $script:deleteSelectedButton.Add_Click({
                 continue
             }
             try {
-                $candidateIdentity = [ProtectionScanner.SafeFileDeletion]::GetFileIdentity($candidatePath)
+                $candidateIdentity = [ProtectionScanner.SafeFileQuarantine]::GetFileIdentity($candidatePath)
                 if ([string]::Equals($candidateIdentity, $selectedIdentity, [System.StringComparison]::Ordinal)) {
                     $rowsForFile.Add($candidateRow)
                 }
@@ -2054,7 +2107,7 @@ $script:deleteSelectedButton.Add_Click({
         $script:deletionRowsByPath = New-ExactPathMap
         $script:deletionSignatureByPath = New-ExactPathMap
         [System.Windows.Forms.MessageBox]::Show(
-            'Не удалось проверить идентификатор одного из файлов с похожим путём. Удаление не запущено.',
+            'Не удалось проверить идентификатор одного из файлов с похожим путём. Перемещение не запущено.',
             'Не удалось проверить файл',
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Warning
@@ -2064,7 +2117,7 @@ $script:deleteSelectedButton.Add_Click({
 
     try {
         $script:deletionAppliedCount = 0
-        $script:deletionBatch = [ProtectionScanner.DeletionBatch]::new(
+        $script:deletionBatch = [ProtectionScanner.QuarantineBatch]::new(
             $requests.ToArray(), [string]$script:enginePath, [string]$script:databaseDirectory,
             [string](Join-Path $script:dataRoot 'verification-temp'), $true
         )
