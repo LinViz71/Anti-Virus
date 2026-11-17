@@ -386,6 +386,14 @@ namespace ProtectionScanner {
         private const uint AttributeReparsePoint = 0x00000400;
         private const int FileAttributeTagInfo = 9;
         private const int FileRenameInfo = 3;
+        private const int FileDispositionInfoClass = 4;
+        private const uint GenericWrite = 0x40000000;
+        private const uint Synchronize = 0x00100000;
+        private const uint FileAttributeNormal = 0x00000080;
+        private const uint FileCreate = 2;
+        private const uint FileNonDirectoryFile = 0x00000040;
+        private const uint FileSynchronousIoNonAlert = 0x00000020;
+        private const uint ObjectCaseInsensitive = 0x00000040;
         private const int ErrorFileExists = 80;
         private const int ErrorAlreadyExists = 183;
         private const uint FileBegin = 0;
@@ -407,6 +415,26 @@ namespace ProtectionScanner {
             public uint FileIndexHigh;
             public uint FileIndexLow;
         }
+        [StructLayout(LayoutKind.Sequential)]
+        private struct UnicodeString {
+            public ushort Length;
+            public ushort MaximumLength;
+            public IntPtr Buffer;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ObjectAttributes {
+            public uint Length;
+            public IntPtr RootDirectory;
+            public IntPtr ObjectName;
+            public uint Attributes;
+            public IntPtr SecurityDescriptor;
+            public IntPtr SecurityQualityOfService;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        private struct IoStatusBlock {
+            public IntPtr Status;
+            public UIntPtr Information;
+        }
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern SafeFileHandle CreateFile(string path, uint access, uint share,
             IntPtr security, uint creation, uint flags, IntPtr template);
@@ -423,11 +451,23 @@ namespace ProtectionScanner {
         private static extern bool ReadFile(SafeFileHandle handle, byte[] buffer, uint count,
             out uint read, IntPtr overlapped);
         [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool WriteFile(SafeFileHandle handle, byte[] buffer, uint count,
+            out uint written, IntPtr overlapped);
+        [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool SetFilePointerEx(SafeFileHandle handle, long distance,
             out long newPosition, uint moveMethod);
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool SetFileInformationByHandle(SafeFileHandle handle, int infoClass,
             IntPtr info, uint size);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool FlushFileBuffers(SafeFileHandle handle);
+        [DllImport("ntdll.dll", ExactSpelling = true)]
+        private static extern int NtCreateFile(out SafeFileHandle fileHandle, uint desiredAccess,
+            ref ObjectAttributes objectAttributes, out IoStatusBlock ioStatusBlock,
+            IntPtr allocationSize, uint fileAttributes, uint shareAccess, uint createDisposition,
+            uint createOptions, IntPtr eaBuffer, uint eaLength);
+        [DllImport("ntdll.dll", ExactSpelling = true)]
+        private static extern uint RtlNtStatusToDosError(int status);
 
         private static bool IsInsideQuarantine(string path) {
             string[] segments = Path.GetFullPath(path).Split(
@@ -460,9 +500,61 @@ namespace ProtectionScanner {
             return escaped.ToString();
         }
 
-        private static string WriteQuarantineRecord(string quarantinePath, string sourcePath,
-            string sha256, string signature) {
-            string metadataPath = quarantinePath + ".json";
+        private static void MarkFileForDeletion(SafeFileHandle handle) {
+            IntPtr dispositionInfo = Marshal.AllocHGlobal(sizeof(byte));
+            try {
+                Marshal.WriteByte(dispositionInfo, 1);
+                if (!SetFileInformationByHandle(handle, FileDispositionInfoClass,
+                    dispositionInfo, sizeof(byte)))
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            finally { Marshal.FreeHGlobal(dispositionInfo); }
+        }
+
+        private static bool TryMarkFileForDeletion(SafeFileHandle handle) {
+            try { MarkFileForDeletion(handle); return true; }
+            catch { return false; }
+        }
+
+        private static SafeFileHandle CreateFileInDirectory(SafeFileHandle directoryHandle, string fileName) {
+            // Open relative to the validated directory handle to keep metadata beside the quarantined file.
+            IntPtr fileNameBuffer = Marshal.StringToHGlobalUni(fileName);
+            IntPtr unicodeStringPointer = IntPtr.Zero;
+            try {
+                UnicodeString unicodeName = new UnicodeString {
+                    Length = (ushort)(fileName.Length * sizeof(char)),
+                    MaximumLength = (ushort)((fileName.Length + 1) * sizeof(char)),
+                    Buffer = fileNameBuffer
+                };
+                unicodeStringPointer = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UnicodeString)));
+                Marshal.StructureToPtr(unicodeName, unicodeStringPointer, false);
+                ObjectAttributes objectAttributes = new ObjectAttributes {
+                    Length = (uint)Marshal.SizeOf(typeof(ObjectAttributes)),
+                    RootDirectory = directoryHandle.DangerousGetHandle(),
+                    ObjectName = unicodeStringPointer,
+                    Attributes = ObjectCaseInsensitive
+                };
+                IoStatusBlock ioStatus;
+                SafeFileHandle fileHandle;
+                int status = NtCreateFile(out fileHandle,
+                    GenericWrite | DeleteAccess | Synchronize, ref objectAttributes, out ioStatus,
+                    IntPtr.Zero, FileAttributeNormal, 0, FileCreate,
+                    FileNonDirectoryFile | FileSynchronousIoNonAlert, IntPtr.Zero, 0);
+                if (status < 0) {
+                    if (fileHandle != null) fileHandle.Dispose();
+                    throw new Win32Exception((int)RtlNtStatusToDosError(status));
+                }
+                return fileHandle;
+            }
+            finally {
+                if (unicodeStringPointer != IntPtr.Zero) Marshal.FreeHGlobal(unicodeStringPointer);
+                Marshal.FreeHGlobal(fileNameBuffer);
+            }
+        }
+
+        private static SafeFileHandle WriteQuarantineRecord(SafeFileHandle directoryHandle,
+            string metadataFileName, string sourcePath, string quarantinePath, string sha256,
+            string signature) {
             string record = "{\r\n" +
                 "  \"Version\": 1,\r\n" +
                 "  \"OriginalPath\": \"" + JsonEscape(sourcePath) + "\",\r\n" +
@@ -471,12 +563,24 @@ namespace ProtectionScanner {
                 "  \"Signature\": \"" + JsonEscape(signature) + "\"\r\n" +
                 "}\r\n";
             byte[] data = new UTF8Encoding(false).GetBytes(record);
-            using (FileStream stream = new FileStream(metadataPath, FileMode.CreateNew,
-                FileAccess.Write, FileShare.None)) {
-                stream.Write(data, 0, data.Length);
-                stream.Flush(true);
+            SafeFileHandle metadataHandle = CreateFileInDirectory(directoryHandle, metadataFileName);
+            try {
+                uint bytesWritten;
+                if (!WriteFile(metadataHandle, data, (uint)data.Length, out bytesWritten, IntPtr.Zero))
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                if (bytesWritten != (uint)data.Length)
+                    throw new IOException("Не удалось полностью записать сведения карантина.");
+                if (!FlushFileBuffers(metadataHandle))
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                return metadataHandle;
             }
-            return metadataPath;
+            catch {
+                bool removed = TryMarkFileForDeletion(metadataHandle);
+                metadataHandle.Dispose();
+                if (!removed)
+                    throw new IOException("Не удалось удалить неполную запись карантина " + metadataFileName + ".");
+                throw;
+            }
         }
 
         private static string MoveHandleToQuarantine(SafeFileHandle fileHandle, string sourcePath,
@@ -503,7 +607,7 @@ namespace ProtectionScanner {
                 throw new InvalidOperationException("Существующая папка карантина не создана этой программой.");
             }
             using (SafeFileHandle directoryHandle = CreateFile(quarantineDirectory,
-                AddFile | ReadAttributes, ShareRead | ShareWrite | ShareDelete, IntPtr.Zero,
+                AddFile | ReadAttributes, ShareRead | ShareWrite, IntPtr.Zero,
                 OpenExisting, OpenReparsePoint | BackupSemantics, IntPtr.Zero)) {
                 if (directoryHandle.IsInvalid)
                     throw new Win32Exception(Marshal.GetLastWin32Error());
@@ -517,15 +621,18 @@ namespace ProtectionScanner {
 
                 string fileName = Guid.NewGuid().ToString("N") + ".quarantine";
                 string quarantinePath = Path.Combine(quarantineDirectory, fileName);
-                string metadataPath = WriteQuarantineRecord(quarantinePath, fullSourcePath, sha256, signature);
-                bool moved = false;
+                string metadataFileName = fileName + ".json";
                 byte[] fileNameBytes = Encoding.Unicode.GetBytes(fileName);
                 int rootDirectoryOffset = IntPtr.Size == 8 ? 8 : 4;
                 int fileNameLengthOffset = rootDirectoryOffset + IntPtr.Size;
                 int fileNameOffset = fileNameLengthOffset + sizeof(uint);
                 int bufferLength = fileNameOffset + fileNameBytes.Length;
-                IntPtr renameInfo = Marshal.AllocHGlobal(bufferLength);
+                SafeFileHandle metadataHandle = WriteQuarantineRecord(directoryHandle,
+                    metadataFileName, fullSourcePath, quarantinePath, sha256, signature);
+                bool moved = false;
+                IntPtr renameInfo = IntPtr.Zero;
                 try {
+                    renameInfo = Marshal.AllocHGlobal(bufferLength);
                     for (int index = 0; index < bufferLength; index++) Marshal.WriteByte(renameInfo, index, 0);
                     Marshal.WriteInt32(renameInfo, 0, 0);
                     Marshal.WriteIntPtr(renameInfo, rootDirectoryOffset, directoryHandle.DangerousGetHandle());
@@ -536,10 +643,12 @@ namespace ProtectionScanner {
                     moved = true;
                 }
                 finally {
-                    Marshal.FreeHGlobal(renameInfo);
-                    if (!moved) {
-                        try { File.Delete(metadataPath); } catch { }
-                    }
+                    if (renameInfo != IntPtr.Zero) Marshal.FreeHGlobal(renameInfo);
+                    bool metadataRemoved = moved || TryMarkFileForDeletion(metadataHandle);
+                    metadataHandle.Dispose();
+                    if (!metadataRemoved)
+                        throw new IOException("Не удалось удалить запись карантина после отменённого перемещения " +
+                            metadataFileName + ".");
                 }
                 return quarantinePath;
             }
