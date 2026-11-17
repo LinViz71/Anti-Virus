@@ -576,12 +576,12 @@ namespace ProtectionScanner {
             }
             catch (Exception writeError) {
                 bool removed = TryMarkFileForDeletion(metadataHandle);
+                metadataHandle.Dispose();
                 if (!removed)
                     throw new IOException("Не удалось удалить неполную запись карантина " + metadataFileName +
                         ". Ошибка записи: " + writeError.Message, writeError);
                 throw;
             }
-            finally { metadataHandle.Dispose(); }
         }
 
         private static string MoveHandleToQuarantine(SafeFileHandle fileHandle, string sourcePath,
