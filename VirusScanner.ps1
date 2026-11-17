@@ -574,13 +574,14 @@ namespace ProtectionScanner {
                     throw new Win32Exception(Marshal.GetLastWin32Error());
                 return metadataHandle;
             }
-            catch {
+            catch (Exception writeError) {
                 bool removed = TryMarkFileForDeletion(metadataHandle);
-                metadataHandle.Dispose();
                 if (!removed)
-                    throw new IOException("Не удалось удалить неполную запись карантина " + metadataFileName + ".");
+                    throw new IOException("Не удалось удалить неполную запись карантина " + metadataFileName +
+                        ". Ошибка записи: " + writeError.Message, writeError);
                 throw;
             }
+            finally { metadataHandle.Dispose(); }
         }
 
         private static string MoveHandleToQuarantine(SafeFileHandle fileHandle, string sourcePath,
@@ -629,7 +630,6 @@ namespace ProtectionScanner {
                 int bufferLength = fileNameOffset + fileNameBytes.Length;
                 SafeFileHandle metadataHandle = WriteQuarantineRecord(directoryHandle,
                     metadataFileName, fullSourcePath, quarantinePath, sha256, signature);
-                bool moved = false;
                 IntPtr renameInfo = IntPtr.Zero;
                 try {
                     renameInfo = Marshal.AllocHGlobal(bufferLength);
@@ -640,15 +640,16 @@ namespace ProtectionScanner {
                     Marshal.Copy(fileNameBytes, 0, IntPtr.Add(renameInfo, fileNameOffset), fileNameBytes.Length);
                     if (!SetFileInformationByHandle(fileHandle, FileRenameInfo, renameInfo, (uint)bufferLength))
                         throw new Win32Exception(Marshal.GetLastWin32Error());
-                    moved = true;
+                }
+                catch (Exception moveError) {
+                    if (!TryMarkFileForDeletion(metadataHandle))
+                        throw new IOException("Не удалось удалить запись карантина после ошибки перемещения " +
+                            metadataFileName + ". Ошибка перемещения: " + moveError.Message, moveError);
+                    throw;
                 }
                 finally {
                     if (renameInfo != IntPtr.Zero) Marshal.FreeHGlobal(renameInfo);
-                    bool metadataRemoved = moved || TryMarkFileForDeletion(metadataHandle);
                     metadataHandle.Dispose();
-                    if (!metadataRemoved)
-                        throw new IOException("Не удалось удалить запись карантина после отменённого перемещения " +
-                            metadataFileName + ".");
                 }
                 return quarantinePath;
             }
