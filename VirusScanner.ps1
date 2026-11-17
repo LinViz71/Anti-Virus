@@ -143,8 +143,9 @@ namespace ProtectionScanner {
                     }
                     else resultsTruncated = true;
                 }
-                if (resultIndex >= 0 && CanQuarantineDetection(resultMatch.Groups[2].Value)) {
-                    string filePath = resultMatch.Groups[1].Value;
+                string filePath = resultMatch.Groups[1].Value;
+                if (resultIndex >= 0 && CanQuarantineDetection(resultMatch.Groups[2].Value) &&
+                    !IsInsideQuarantine(filePath)) {
                     int hashIndex = resultIndex;
                     Task hashTask = Task.Run(async () => {
                         bool slotAcquired = false;
@@ -190,6 +191,15 @@ namespace ProtectionScanner {
             return !Regex.IsMatch(signature,
                 @"(^|\.)(Heuristics|PUA|Phishing|Broken|Encrypted|Limit|Limits|Exceeded)(\.|$)",
                 RegexOptions.IgnoreCase);
+        }
+
+        private static bool IsInsideQuarantine(string path) {
+            if (String.IsNullOrWhiteSpace(path)) return false;
+            try {
+                return Regex.IsMatch(Path.GetFullPath(path),
+                    @"(?i)(?:^|[\\/])\.ProtectionScannerQuarantine(?:[\\/]|$)");
+            }
+            catch { return false; }
         }
 
         private static async Task<string> GetFileHashAsync(string path, CancellationToken cancellation) {
@@ -360,6 +370,7 @@ namespace ProtectionScanner {
     }
 
     public static class SafeFileQuarantine {
+        private const string QuarantineDirectoryName = ".ProtectionScannerQuarantine";
         private const uint GenericRead = 0x80000000;
         private const uint DeleteAccess = 0x00010000;
         private const uint ReadAttributes = 0x00000080;
@@ -418,9 +429,63 @@ namespace ProtectionScanner {
         private static extern bool SetFileInformationByHandle(SafeFileHandle handle, int infoClass,
             IntPtr info, uint size);
 
-        private static string MoveHandleToQuarantine(SafeFileHandle fileHandle, string sourcePath) {
-            string parentDirectory = Path.GetDirectoryName(Path.GetFullPath(sourcePath));
-            string quarantineDirectory = Path.Combine(parentDirectory, ".ProtectionScannerQuarantine");
+        private static bool IsInsideQuarantine(string path) {
+            string[] segments = Path.GetFullPath(path).Split(
+                new char[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar },
+                StringSplitOptions.RemoveEmptyEntries);
+            foreach (string segment in segments) {
+                if (String.Equals(segment, QuarantineDirectoryName, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
+        }
+
+        private static string JsonEscape(string value) {
+            StringBuilder escaped = new StringBuilder();
+            foreach (char character in value) {
+                switch (character) {
+                    case '"': escaped.Append("\\\""); break;
+                    case '\\': escaped.Append("\\\\"); break;
+                    case '\b': escaped.Append("\\b"); break;
+                    case '\f': escaped.Append("\\f"); break;
+                    case '\n': escaped.Append("\\n"); break;
+                    case '\r': escaped.Append("\\r"); break;
+                    case '\t': escaped.Append("\\t"); break;
+                    default:
+                        if (character < 0x20) escaped.Append("\\u").Append(((int)character).ToString("x4"));
+                        else escaped.Append(character);
+                        break;
+                }
+            }
+            return escaped.ToString();
+        }
+
+        private static string WriteQuarantineRecord(string quarantinePath, string sourcePath,
+            string sha256, string signature) {
+            string metadataPath = quarantinePath + ".json";
+            string record = "{\r\n" +
+                "  \"Version\": 1,\r\n" +
+                "  \"OriginalPath\": \"" + JsonEscape(sourcePath) + "\",\r\n" +
+                "  \"QuarantinePath\": \"" + JsonEscape(quarantinePath) + "\",\r\n" +
+                "  \"SHA256\": \"" + JsonEscape(sha256) + "\",\r\n" +
+                "  \"Signature\": \"" + JsonEscape(signature) + "\"\r\n" +
+                "}\r\n";
+            byte[] data = new UTF8Encoding(false).GetBytes(record);
+            using (FileStream stream = new FileStream(metadataPath, FileMode.CreateNew,
+                FileAccess.Write, FileShare.None)) {
+                stream.Write(data, 0, data.Length);
+                stream.Flush(true);
+            }
+            return metadataPath;
+        }
+
+        private static string MoveHandleToQuarantine(SafeFileHandle fileHandle, string sourcePath,
+            string sha256, string signature) {
+            string fullSourcePath = Path.GetFullPath(sourcePath);
+            if (IsInsideQuarantine(fullSourcePath))
+                throw new InvalidOperationException("Файл уже находится в карантине; повторное перемещение запрещено.");
+            string parentDirectory = Path.GetDirectoryName(fullSourcePath);
+            string quarantineDirectory = Path.Combine(parentDirectory, QuarantineDirectoryName);
             bool createdDirectory = CreateDirectoryNative(quarantineDirectory, IntPtr.Zero);
             if (!createdDirectory) {
                 int createError = Marshal.GetLastWin32Error();
@@ -451,6 +516,9 @@ namespace ProtectionScanner {
                     throw new InvalidOperationException("Папка карантина не является обычной папкой.");
 
                 string fileName = Guid.NewGuid().ToString("N") + ".quarantine";
+                string quarantinePath = Path.Combine(quarantineDirectory, fileName);
+                string metadataPath = WriteQuarantineRecord(quarantinePath, fullSourcePath, sha256, signature);
+                bool moved = false;
                 byte[] fileNameBytes = Encoding.Unicode.GetBytes(fileName);
                 int rootDirectoryOffset = IntPtr.Size == 8 ? 8 : 4;
                 int fileNameLengthOffset = rootDirectoryOffset + IntPtr.Size;
@@ -465,9 +533,15 @@ namespace ProtectionScanner {
                     Marshal.Copy(fileNameBytes, 0, IntPtr.Add(renameInfo, fileNameOffset), fileNameBytes.Length);
                     if (!SetFileInformationByHandle(fileHandle, FileRenameInfo, renameInfo, (uint)bufferLength))
                         throw new Win32Exception(Marshal.GetLastWin32Error());
+                    moved = true;
                 }
-                finally { Marshal.FreeHGlobal(renameInfo); }
-                return Path.Combine(quarantineDirectory, fileName);
+                finally {
+                    Marshal.FreeHGlobal(renameInfo);
+                    if (!moved) {
+                        try { File.Delete(metadataPath); } catch { }
+                    }
+                }
+                return quarantinePath;
             }
         }
 
@@ -704,6 +778,8 @@ namespace ProtectionScanner {
                 throw new InvalidOperationException("Нет корректного SHA-256 для проверки; помещение в карантин отменено.");
             if (String.IsNullOrWhiteSpace(expectedSignature))
                 throw new InvalidOperationException("Не указана сигнатура для повторной проверки.");
+            if (IsInsideQuarantine(path))
+                throw new InvalidOperationException("Файл уже находится в карантине; повторное перемещение запрещено.");
             uint access = GenericRead | ReadAttributes | (quarantineAfterVerification ? DeleteAccess : 0);
             using (SafeFileHandle handle = CreateFile(path, access,
                 ShareRead, IntPtr.Zero, OpenExisting, OpenReparsePoint, IntPtr.Zero)) {
@@ -727,14 +803,14 @@ namespace ProtectionScanner {
                     throw new InvalidOperationException("Повторная проверка не подтвердила ту же вирусную сигнатуру.");
                 if (!quarantineAfterVerification) return actualHash;
                 deadline.BeginQuarantine(cancellation);
-                return MoveHandleToQuarantine(handle, path);
+                return MoveHandleToQuarantine(handle, path, actualHash, actualSignature);
             }
         }
 
-        internal static string VerifyForConfirmation(string path, string expectedSignature,
+        internal static string VerifyForConfirmation(string path, string expectedHash, string expectedSignature,
             string executable, string databasePath, string tempRoot, CancellationToken cancellation,
             DeletionDeadline deadline) {
-            return VerifyFile(path, null, expectedSignature, executable, databasePath, tempRoot,
+            return VerifyFile(path, expectedHash, expectedSignature, executable, databasePath, tempRoot,
                 cancellation, deadline, false);
         }
 
@@ -867,7 +943,7 @@ namespace ProtectionScanner {
             CancellationTokenSource operationCancellation =
                 CancellationTokenSource.CreateLinkedTokenSource(cancellation.Token);
             Task<string> verification = Task.Run(() => SafeFileQuarantine.VerifyForConfirmation(
-                request.Path, request.Signature, executable, databasePath,
+                request.Path, request.Sha256, request.Signature, executable, databasePath,
                 tempRoot, operationCancellation.Token, deadline));
             try {
                 while (!verification.IsCompleted) {
@@ -1182,16 +1258,18 @@ function Start-ClamScan {
     $script:countProgressPath = Join-Path $script:logsDirectory ('count-' + $scanStamp + '.txt')
     $script:countTargetsPath = Join-Path $script:logsDirectory ('count-targets-' + $scanStamp + '.txt')
     Remove-Item -LiteralPath $script:countProgressPath -Force -ErrorAction SilentlyContinue
-    $jobArguments = @($script:countTargetsPath, $script:countProgressPath)
+    $quarantinePattern = '(?i)(?:^|[\\/])\.ProtectionScannerQuarantine(?:[\\/]|$)'
+    $jobArguments = @($script:countTargetsPath, $script:countProgressPath, $quarantinePattern)
     try {
         [System.IO.File]::WriteAllLines($script:countTargetsPath, [string[]]$script:pendingScanTargets, (New-Object System.Text.UTF8Encoding($true)))
         $script:countJob = Start-Job -ScriptBlock {
-            param([string]$TargetsFile, [string]$ProgressFile)
+            param([string]$TargetsFile, [string]$ProgressFile, [string]$QuarantinePattern)
             $fileCount = 0
             $scanTargets = [System.IO.File]::ReadAllLines($TargetsFile, [System.Text.Encoding]::UTF8)
             foreach ($scanTarget in $scanTargets) {
                 try {
-                    Get-ChildItem -LiteralPath $scanTarget -File -Force -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+                    Get-ChildItem -LiteralPath $scanTarget -File -Force -Recurse -ErrorAction SilentlyContinue |
+                        Where-Object { $_.FullName -notmatch $QuarantinePattern } | ForEach-Object {
                         $fileCount = $fileCount + 1
                         if (($fileCount % 2000) -eq 0) {
                             try { [System.IO.File]::WriteAllText($ProgressFile, [string]$fileCount) } catch { }
@@ -1238,6 +1316,7 @@ function Start-ClamScanEngine {
     $arguments = @(
         '--recursive', '--stdout', '--heuristic-alerts=yes', '--alert-encrypted=yes', '--alert-exceeds-max=yes',
         '--follow-dir-symlinks=0', '--follow-file-symlinks=0', '--fail-if-cvd-older-than=7',
+        '--exclude-dir="(^|[\\/])\.ProtectionScannerQuarantine([\\/]|$)"',
         ('--database="' + $script:databaseDirectory + '"')
     )
     foreach ($target in $script:pendingScanTargets) {
@@ -1328,7 +1407,7 @@ function Add-ReportMatchesToList {
         [void]$row.SubItems.Add($filePath)
         [void]$row.SubItems.Add('Результат сохранён в памяти')
 
-        if (Test-CanQuarantineDetection -ResultText $resultText) {
+        if ((Test-CanQuarantineDetection -ResultText $resultText) -and -not (Test-IsQuarantinePath -Path $filePath)) {
             try {
                 $hash = if ($index -lt $script:scanResultHashes.Count) { $script:scanResultHashes[$index] } else { $null }
                 if (-not $hash) { throw 'Не удалось сохранить хэш файла во время проверки.' }
@@ -1345,7 +1424,12 @@ function Add-ReportMatchesToList {
         else {
             $signature = $resultText -replace '\s+FOUND$', ''
             $row.Tag = [pscustomobject]@{ Path = $filePath; Sha256 = $null; Signature = $signature; CanQuarantine = $false }
-            if ($resultText -match '\bFOUND$') { $row.SubItems[2].Text = 'Предупреждение или нежелательная программа; карантин отключён' }
+            if (($resultText -match '\bFOUND$') -and (Test-IsQuarantinePath -Path $filePath)) {
+                $row.SubItems[2].Text = 'Файл уже находится в карантине; повторное перемещение отключено'
+            }
+            elseif ($resultText -match '\bFOUND$') {
+                $row.SubItems[2].Text = 'Предупреждение или нежелательная программа; карантин отключён'
+            }
         }
         [void]$script:resultsView.Items.Add($row)
     }
@@ -1363,6 +1447,16 @@ function Test-CanQuarantineDetection {
     if ($ResultText -notmatch '\bFOUND$') { return $false }
     $signature = $ResultText -replace '\s+FOUND$', ''
     return $signature -notmatch '(?i)(^|\.)(Heuristics|PUA|Phishing|Broken|Encrypted|Limit|Limits|Exceeded)(\.|$)'
+}
+
+function Test-IsQuarantinePath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    try {
+        $fullPath = [System.IO.Path]::GetFullPath($Path)
+        return $fullPath -match '(?i)(?:^|[\\/])\.ProtectionScannerQuarantine(?:[\\/]|$)'
+    }
+    catch { return $false }
 }
 
 function Confirm-QuarantineSelection {
@@ -1461,7 +1555,7 @@ function Apply-DeletionResults {
             if ($result.Quarantined) {
                 foreach ($row in $matchingRows) {
                     $row.SubItems[0].Text = 'FOUND — в карантине'
-                    $row.SubItems[2].Text = [string]$result.QuarantinePath
+                    $row.SubItems[2].Text = ('В карантине: {0}; сведения для восстановления: {0}.json' -f [string]$result.QuarantinePath)
                     $row.Tag.CanQuarantine = $false
                 }
             }
